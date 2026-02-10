@@ -1,4 +1,6 @@
-﻿const APP_VERSION = '2026-02-10-v13';
+﻿const APP_VERSION = '2026-02-10-v14';
+const IMAGE_JOB_QUEUE_KEY = 'image_job_queue_v1';
+const IMAGE_JOB_BATCH_SIZE = 2;
 
 function doGet() {
   return createTextResponse_('LINE receipt bot is running. ' + APP_VERSION);
@@ -72,14 +74,13 @@ function processWebhookEvent_(event) {
 
 function handleImageMessage_(event) {
   const messageId = event.message.id;
+  const pushTarget = extractPushTargetId_(event);
   if (!messageId) {
-    const pushTarget = extractPushTargetId_(event);
     notifyUserByPushOrReply_(event, pushTarget, '画像IDが取得できませんでした。もう一度お試しください。');
     return;
   }
 
-  const pushTarget = extractPushTargetId_(event);
-  console.log('handleImageMessage_: start messageId=' + messageId + ' hasPushTarget=' + Boolean(pushTarget));
+  console.log('handleImageMessage_: enqueue messageId=' + messageId + ' hasPushTarget=' + Boolean(pushTarget));
 
   const acceptedMessage = '画像を受け取りました。解析中です。完了したら結果を送信します。';
   const acceptedByReply = safeReplyLineText_(event.replyToken, acceptedMessage);
@@ -90,32 +91,16 @@ function handleImageMessage_(event) {
   }
 
   try {
-    console.log('handleImageMessage_: fetch content messageId=' + messageId);
-    const content = fetchLineMessageContent_(messageId);
-    console.log('handleImageMessage_: content fetched bytes=' + content.bytes.length + ' mimeType=' + content.mimeType);
-
-    const savedFile = saveReceiptImageToDrive_(content.bytes, content.mimeType, new Date(), messageId);
-    console.log('handleImageMessage_: image saved fileId=' + savedFile.id);
-
-    const analysis = analyzeReceiptImage_(content.bytes, content.mimeType);
-    const itemCount = analysis.items && analysis.items.length ? analysis.items.length : 0;
-    console.log('handleImageMessage_: analysis done itemCount=' + itemCount + ' total=' + toNumber_(analysis.total));
-
-    const hasItems = analysis.items && analysis.items.length > 0;
-    if (!hasItems && !toNumber_(analysis.total)) {
-      notifyUserByPushOrReply_(event, pushTarget, 'レシートを読み取れませんでした。別の画像でお試しください。');
-      return;
-    }
-
-    appendReceiptToSheet_(analysis);
-    console.log('handleImageMessage_: wrote rows to spreadsheet');
-
-    const summary = buildMonthlySummary_(new Date());
-    const message = formatReceiptReply_(analysis, summary, savedFile);
-    notifyUserByPushOrReply_(event, pushTarget, message);
+    const queueLength = enqueueImageJob_({
+      messageId: messageId,
+      pushTarget: pushTarget,
+      enqueuedAt: new Date().toISOString()
+    });
+    console.log('handleImageMessage_: queued messageId=' + messageId + ' queueLength=' + queueLength);
+    ensureImageWorkerTrigger_();
   } catch (error) {
-    console.error('handleImageMessage_ failed: ' + (error && error.stack ? error.stack : error));
-    notifyUserByPushOrReply_(event, pushTarget, '画像の解析中にエラーが発生しました。時間をおいて再度お試しください。');
+    console.error('handleImageMessage_: enqueue failed: ' + (error && error.stack ? error.stack : error));
+    notifyUserByPushOrReply_(event, pushTarget, '画像の受付でエラーが発生しました。時間をおいて再度お試しください。');
   }
 }
 
@@ -303,6 +288,9 @@ function extractPushTargetId_(event) {
 }
 
 function safePushLineText_(to, messageText) {
+  if (!to) {
+    return false;
+  }
   try {
     pushLineText_(to, messageText);
     return true;
@@ -335,6 +323,138 @@ function notifyUserByPushOrReply_(event, pushTarget, messageText) {
   }
 
   return false;
+}
+
+function enqueueImageJob_(job) {
+  return mutateImageJobQueue_(function(queue) {
+    queue.push(job);
+    return queue.length;
+  });
+}
+
+function dequeueImageJobBatch_(limit) {
+  const maxJobs = Math.max(1, Number(limit) || 1);
+  return mutateImageJobQueue_(function(queue) {
+    const jobs = queue.splice(0, maxJobs);
+    return {
+      jobs: jobs,
+      remaining: queue.length
+    };
+  });
+}
+
+function getImageJobQueueLength_() {
+  const props = PropertiesService.getScriptProperties();
+  const raw = props.getProperty(IMAGE_JOB_QUEUE_KEY);
+  if (!raw) {
+    return 0;
+  }
+
+  try {
+    const queue = JSON.parse(raw);
+    return Array.isArray(queue) ? queue.length : 0;
+  } catch (error) {
+    console.warn('getImageJobQueueLength_: invalid queue JSON. ' + error);
+    return 0;
+  }
+}
+
+function mutateImageJobQueue_(mutator) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(5000);
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const raw = props.getProperty(IMAGE_JOB_QUEUE_KEY);
+    let queue = [];
+
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        queue = Array.isArray(parsed) ? parsed : [];
+      } catch (parseError) {
+        console.warn('mutateImageJobQueue_: failed to parse queue; reset. ' + parseError);
+      }
+    }
+
+    const result = mutator(queue);
+    if (queue.length > 0) {
+      props.setProperty(IMAGE_JOB_QUEUE_KEY, JSON.stringify(queue));
+    } else {
+      props.deleteProperty(IMAGE_JOB_QUEUE_KEY);
+    }
+    return result;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function ensureImageWorkerTrigger_() {
+  const handler = 'processPendingImageJobs_';
+  const exists = ScriptApp.getProjectTriggers().some(function(trigger) {
+    return trigger.getHandlerFunction() === handler;
+  });
+  if (exists) {
+    return false;
+  }
+
+  ScriptApp.newTrigger(handler).timeBased().after(10000).create();
+  return true;
+}
+
+function processPendingImageJobs_() {
+  assertRequiredConfig_();
+
+  const batch = dequeueImageJobBatch_(IMAGE_JOB_BATCH_SIZE);
+  const jobs = batch.jobs || [];
+  if (!jobs.length) {
+    console.log('processPendingImageJobs_: no queued jobs');
+    return;
+  }
+
+  console.log('processPendingImageJobs_: start jobs=' + jobs.length + ' remaining=' + batch.remaining);
+  jobs.forEach(function(job) {
+    processSingleImageJobSafely_(job);
+  });
+
+  if (batch.remaining > 0 || getImageJobQueueLength_() > 0) {
+    ensureImageWorkerTrigger_();
+  }
+}
+
+function processSingleImageJobSafely_(job) {
+  const messageId = job && job.messageId ? String(job.messageId) : '';
+  const pushTarget = job && job.pushTarget ? String(job.pushTarget) : '';
+  if (!messageId) {
+    console.warn('processSingleImageJobSafely_: skipped invalid job');
+    return;
+  }
+
+  try {
+    console.log('processSingleImageJobSafely_: fetch content messageId=' + messageId);
+    const content = fetchLineMessageContent_(messageId);
+    console.log('processSingleImageJobSafely_: content fetched bytes=' + content.bytes.length + ' mimeType=' + content.mimeType);
+
+    const savedFile = saveReceiptImageToDrive_(content.bytes, content.mimeType, new Date(), messageId);
+    console.log('processSingleImageJobSafely_: image saved fileId=' + savedFile.id);
+
+    const analysis = analyzeReceiptImage_(content.bytes, content.mimeType);
+    const itemCount = analysis.items && analysis.items.length ? analysis.items.length : 0;
+    console.log('processSingleImageJobSafely_: analysis done itemCount=' + itemCount + ' total=' + toNumber_(analysis.total));
+
+    const hasItems = analysis.items && analysis.items.length > 0;
+    if (!hasItems && !toNumber_(analysis.total)) {
+      safePushLineText_(pushTarget, 'レシートを読み取れませんでした。別の画像でお試しください。');
+      return;
+    }
+
+    appendReceiptToSheet_(analysis);
+    const summary = buildMonthlySummary_(new Date());
+    const message = formatReceiptReply_(analysis, summary, savedFile);
+    safePushLineText_(pushTarget, message);
+  } catch (error) {
+    console.error('processSingleImageJobSafely_ failed messageId=' + messageId + ': ' + (error && error.stack ? error.stack : error));
+    safePushLineText_(pushTarget, '画像の解析中にエラーが発生しました。時間をおいて再度お試しください。');
+  }
 }
 
 function isDuplicateEvent_(event) {
