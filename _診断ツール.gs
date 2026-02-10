@@ -341,3 +341,17 @@ function listAvailableGeminiModels() {
     }
   }
 }
+
+/**
+ * Gemini APIキーを更新する (セキュリティのため、関数内にキーを直接書かない)
+ * 引数にキーを渡して実行するか、GASエディタのプロパティ設定から直接更新してください
+ */
+function updateGeminiApiKey(newKey) {
+  if (!newKey) {
+    console.error('❌ キーが指定されていません。 updateGeminiApiKey("あなたのキー") のように実行してください。');
+    return;
+  }
+  PropertiesService.getScriptProperties().setProperty('GEMINI_API_KEY', newKey);
+  console.log('✅ Gemini APIキーを更新しました: ' + newKey.slice(0, 8) + '...');
+  return 'APIキーを更新しました。';
+}
