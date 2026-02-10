@@ -1,138 +1,62 @@
 ﻿const APP_VERSION = '2026-02-11-v20';
-const IMAGE_JOB_QUEUE_KEY = 'image_job_queue_v1';
-const IMAGE_JOB_BATCH_SIZE = 2;
 
 function doGet() {
   return createTextResponse_('LINE receipt bot is running. ' + APP_VERSION);
 }
 
-/**
- * 処理待ちの画像を手動で処理する
- * GASエディタの関数リストから実行できます
- */
-function processQueuedImages() {
-  console.log('=== 処理待ち画像の処理を開始 ===');
-  
-  try {
-    const queueLength = getImageJobQueueLength_();
-    console.log('処理待ちの画像: ' + queueLength + '件');
-    
-    if (queueLength === 0) {
-      console.log('✅ 処理待ちの画像はありません');
-      return '処理待ちの画像はありません';
-    }
-    
-    processPendingImageJobs_();
-    
-    console.log('=== 処理完了 ===');
-    console.log('LINEを確認してください。解析結果が送信されているはずです。');
-    
-    return '処理完了。LINEを確認してください。';
-  } catch (e) {
-    console.error('エラー: ' + (e && e.stack ? e.stack : e));
-    return 'エラーが発生しました: ' + e;
-  }
-}
-
-/**
- * 画像処理キューをクリアする
- * 古いメッセージIDが残っている場合に使用
- */
-function clearImageQueue() {
-  console.log('=== 画像処理キューのクリア ===');
-  
-  try {
-    const beforeLength = getImageJobQueueLength_();
-    console.log('クリア前のキュー: ' + beforeLength + '件');
-    
-    const props = PropertiesService.getScriptProperties();
-    props.deleteProperty(IMAGE_JOB_QUEUE_KEY);
-    
-    const afterLength = getImageJobQueueLength_();
-    console.log('クリア後のキュー: ' + afterLength + '件');
-    console.log('✅ キューをクリアしました');
-    
-    return 'キューをクリアしました（' + beforeLength + '件削除）';
-  } catch (e) {
-    console.error('エラー: ' + (e && e.stack ? e.stack : e));
-    return 'エラーが発生しました: ' + e;
-  }
-}
 
 function doPost(e) {
-  const debugLog = [];
-  const dlog = function(msg) {
-    console.log(msg);
-    debugLog.push(new Date().toISOString().slice(11,19) + ' ' + msg);
-  };
-  
-  dlog('=== doPost called === VERSION=' + APP_VERSION);
+  console.log('=== doPost called === VERSION=' + APP_VERSION);
   
   // Webhook呼び出しを記録
   try {
     const cache = CacheService.getScriptCache();
     cache.put('last_webhook_time', new Date().toISOString(), 600);
   } catch (cacheError) {
-    dlog('WARN: cache write failed: ' + cacheError);
+    console.warn('WARN: cache write failed: ' + cacheError);
   }
   
   try {
     assertRequiredConfig_();
-    dlog('config OK');
+    console.log('config OK');
 
     const requestBody = e && e.postData && e.postData.contents ? e.postData.contents : '';
     if (!requestBody) {
-      dlog('empty body');
-      saveDebugLog_(debugLog);
+      console.log('empty body');
       return createTextResponse_('ok');
     }
-    dlog('body len=' + requestBody.length);
+    console.log('body len=' + requestBody.length);
 
     const signature = extractLineSignature_(e);
-    dlog('signature=' + (signature ? 'found' : 'NOT FOUND'));
-    
     if (!verifyLineSignature_(requestBody, signature)) {
-      dlog('❌ SIGNATURE VERIFICATION FAILED');
-      saveDebugLog_(debugLog);
+      console.log('❌ SIGNATURE VERIFICATION FAILED');
       return createTextResponse_('ok');
     }
-    dlog('signature verified OK');
+    console.log('signature verified OK');
 
     const payload = JSON.parse(requestBody);
     const events = payload.events || [];
-    dlog('events count=' + events.length);
+    console.log('events count=' + events.length);
     
     events.forEach(function(event, i) {
-      dlog('event[' + i + '] type=' + (event ? event.type : 'null') + ' msgType=' + (event && event.message ? event.message.type : 'N/A'));
-      dlog('event[' + i + '] replyToken=' + (event && event.replyToken ? 'exists' : 'null'));
-      dlog('event[' + i + '] source=' + JSON.stringify(event && event.source ? event.source : null));
+      console.log('event[' + i + '] type=' + (event ? event.type : 'null') + ' msgType=' + (event && event.message ? event.message.type : 'N/A'));
       
       try {
         processWebhookEventSafely_(event);
-        dlog('event[' + i + '] processed OK');
+        console.log('event[' + i + '] processed OK');
       } catch (evtErr) {
-        dlog('event[' + i + '] ERROR: ' + evtErr);
+        console.error('event[' + i + '] ERROR: ' + evtErr);
       }
     });
 
-    dlog('=== doPost completed ===');
-    saveDebugLog_(debugLog);
+    console.log('=== doPost completed ===');
     return createTextResponse_('ok');
   } catch (error) {
-    dlog('❌ FATAL ERROR: ' + (error && error.stack ? error.stack : error));
-    saveDebugLog_(debugLog);
+    console.error('❌ FATAL ERROR: ' + (error && error.stack ? error.stack : error));
     return createTextResponse_('ok');
   }
 }
 
-function saveDebugLog_(logLines) {
-  try {
-    const cache = CacheService.getScriptCache();
-    cache.put('last_dopost_log', logLines.join('\n'), 600);
-  } catch (e) {
-    console.warn('saveDebugLog_ failed: ' + e);
-  }
-}
 
 function processWebhookEventSafely_(event) {
   try {
@@ -468,137 +392,6 @@ function notifyUserByPushOrReply_(event, pushTarget, messageText) {
   return false;
 }
 
-function enqueueImageJob_(job) {
-  return mutateImageJobQueue_(function(queue) {
-    queue.push(job);
-    return queue.length;
-  });
-}
-
-function dequeueImageJobBatch_(limit) {
-  const maxJobs = Math.max(1, Number(limit) || 1);
-  return mutateImageJobQueue_(function(queue) {
-    const jobs = queue.splice(0, maxJobs);
-    return {
-      jobs: jobs,
-      remaining: queue.length
-    };
-  });
-}
-
-function getImageJobQueueLength_() {
-  const props = PropertiesService.getScriptProperties();
-  const raw = props.getProperty(IMAGE_JOB_QUEUE_KEY);
-  if (!raw) {
-    return 0;
-  }
-
-  try {
-    const queue = JSON.parse(raw);
-    return Array.isArray(queue) ? queue.length : 0;
-  } catch (error) {
-    console.warn('getImageJobQueueLength_: invalid queue JSON. ' + error);
-    return 0;
-  }
-}
-
-function mutateImageJobQueue_(mutator) {
-  const lock = LockService.getScriptLock();
-  lock.waitLock(5000);
-  try {
-    const props = PropertiesService.getScriptProperties();
-    const raw = props.getProperty(IMAGE_JOB_QUEUE_KEY);
-    let queue = [];
-
-    if (raw) {
-      try {
-        const parsed = JSON.parse(raw);
-        queue = Array.isArray(parsed) ? parsed : [];
-      } catch (parseError) {
-        console.warn('mutateImageJobQueue_: failed to parse queue; reset. ' + parseError);
-      }
-    }
-
-    const result = mutator(queue);
-    if (queue.length > 0) {
-      props.setProperty(IMAGE_JOB_QUEUE_KEY, JSON.stringify(queue));
-    } else {
-      props.deleteProperty(IMAGE_JOB_QUEUE_KEY);
-    }
-    return result;
-  } finally {
-    lock.releaseLock();
-  }
-}
-
-function ensureImageWorkerTrigger_() {
-  const handler = 'processPendingImageJobs_';
-  const exists = ScriptApp.getProjectTriggers().some(function(trigger) {
-    return trigger.getHandlerFunction() === handler;
-  });
-  if (exists) {
-    return false;
-  }
-
-  ScriptApp.newTrigger(handler).timeBased().after(10000).create();
-  return true;
-}
-
-function processPendingImageJobs_() {
-  assertRequiredConfig_();
-
-  const batch = dequeueImageJobBatch_(IMAGE_JOB_BATCH_SIZE);
-  const jobs = batch.jobs || [];
-  if (!jobs.length) {
-    console.log('processPendingImageJobs_: no queued jobs');
-    return;
-  }
-
-  console.log('processPendingImageJobs_: start jobs=' + jobs.length + ' remaining=' + batch.remaining);
-  jobs.forEach(function(job) {
-    processSingleImageJobSafely_(job);
-  });
-
-  if (batch.remaining > 0 || getImageJobQueueLength_() > 0) {
-    ensureImageWorkerTrigger_();
-  }
-}
-
-function processSingleImageJobSafely_(job) {
-  const messageId = job && job.messageId ? String(job.messageId) : '';
-  const pushTarget = job && job.pushTarget ? String(job.pushTarget) : '';
-  if (!messageId) {
-    console.warn('processSingleImageJobSafely_: skipped invalid job');
-    return;
-  }
-
-  try {
-    console.log('processSingleImageJobSafely_: fetch content messageId=' + messageId);
-    const content = fetchLineMessageContent_(messageId);
-    console.log('processSingleImageJobSafely_: content fetched bytes=' + content.bytes.length + ' mimeType=' + content.mimeType);
-
-    const savedFile = saveReceiptImageToDrive_(content.bytes, content.mimeType, new Date(), messageId);
-    console.log('processSingleImageJobSafely_: image saved fileId=' + savedFile.id);
-
-    const analysis = analyzeReceiptImage_(content.bytes, content.mimeType);
-    const itemCount = analysis.items && analysis.items.length ? analysis.items.length : 0;
-    console.log('processSingleImageJobSafely_: analysis done itemCount=' + itemCount + ' total=' + toNumber_(analysis.total));
-
-    const hasItems = analysis.items && analysis.items.length > 0;
-    if (!hasItems && !toNumber_(analysis.total)) {
-      safePushLineText_(pushTarget, 'レシートを読み取れませんでした。別の画像でお試しください。');
-      return;
-    }
-
-    appendReceiptToSheet_(analysis);
-    const summary = buildMonthlySummary_(new Date());
-    const message = formatReceiptReply_(analysis, summary, savedFile);
-    safePushLineText_(pushTarget, message);
-  } catch (error) {
-    console.error('processSingleImageJobSafely_ failed messageId=' + messageId + ': ' + (error && error.stack ? error.stack : error));
-    safePushLineText_(pushTarget, '画像の解析中にエラーが発生しました。時間をおいて再度お試しください。');
-  }
-}
 
 function isDuplicateEvent_(event) {
   const keySource =
