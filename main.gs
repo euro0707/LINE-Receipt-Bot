@@ -1,4 +1,4 @@
-﻿const APP_VERSION = '2026-02-10-v9';
+﻿const APP_VERSION = '2026-02-10-v13';
 
 function doGet() {
   return createTextResponse_('LINE receipt bot is running. ' + APP_VERSION);
@@ -37,9 +37,8 @@ function processWebhookEventSafely_(event) {
     processWebhookEvent_(event);
   } catch (error) {
     console.error(error && error.stack ? error.stack : error);
-    if (event && event.replyToken && event.mode !== 'standby') {
-      replyLineText_(event.replyToken, 'システムエラーが発生しました。時間をおいてお試しください。');
-    }
+    const pushTarget = extractPushTargetId_(event);
+    notifyUserByPushOrReply_(event, pushTarget, 'システムエラーが発生しました。時間をおいてお試しください。');
   }
 }
 
@@ -74,25 +73,50 @@ function processWebhookEvent_(event) {
 function handleImageMessage_(event) {
   const messageId = event.message.id;
   if (!messageId) {
-    replyLineText_(event.replyToken, '画像IDが取得できませんでした。もう一度お試しください。');
+    const pushTarget = extractPushTargetId_(event);
+    notifyUserByPushOrReply_(event, pushTarget, '画像IDが取得できませんでした。もう一度お試しください。');
     return;
   }
 
-  const content = fetchLineMessageContent_(messageId);
-  const savedFile = saveReceiptImageToDrive_(content.bytes, content.mimeType, new Date(), messageId);
-  const analysis = analyzeReceiptImage_(content.bytes, content.mimeType);
+  const pushTarget = extractPushTargetId_(event);
+  console.log('handleImageMessage_: start messageId=' + messageId + ' hasPushTarget=' + Boolean(pushTarget));
 
-  const hasItems = analysis.items && analysis.items.length > 0;
-  if (!hasItems && !toNumber_(analysis.total)) {
-    replyLineText_(event.replyToken, 'レシートを読み取れませんでした。別の画像でお試しください。');
-    return;
+  const acceptedMessage = '画像を受け取りました。解析中です。完了したら結果を送信します。';
+  const acceptedByReply = safeReplyLineText_(event.replyToken, acceptedMessage);
+  if (acceptedByReply) {
+    event.__replied = true;
+  } else if (pushTarget) {
+    safePushLineText_(pushTarget, acceptedMessage);
   }
 
-  appendReceiptToSheet_(analysis);
-  const summary = buildMonthlySummary_(new Date());
-  const message = formatReceiptReply_(analysis, summary, savedFile);
+  try {
+    console.log('handleImageMessage_: fetch content messageId=' + messageId);
+    const content = fetchLineMessageContent_(messageId);
+    console.log('handleImageMessage_: content fetched bytes=' + content.bytes.length + ' mimeType=' + content.mimeType);
 
-  replyLineText_(event.replyToken, message);
+    const savedFile = saveReceiptImageToDrive_(content.bytes, content.mimeType, new Date(), messageId);
+    console.log('handleImageMessage_: image saved fileId=' + savedFile.id);
+
+    const analysis = analyzeReceiptImage_(content.bytes, content.mimeType);
+    const itemCount = analysis.items && analysis.items.length ? analysis.items.length : 0;
+    console.log('handleImageMessage_: analysis done itemCount=' + itemCount + ' total=' + toNumber_(analysis.total));
+
+    const hasItems = analysis.items && analysis.items.length > 0;
+    if (!hasItems && !toNumber_(analysis.total)) {
+      notifyUserByPushOrReply_(event, pushTarget, 'レシートを読み取れませんでした。別の画像でお試しください。');
+      return;
+    }
+
+    appendReceiptToSheet_(analysis);
+    console.log('handleImageMessage_: wrote rows to spreadsheet');
+
+    const summary = buildMonthlySummary_(new Date());
+    const message = formatReceiptReply_(analysis, summary, savedFile);
+    notifyUserByPushOrReply_(event, pushTarget, message);
+  } catch (error) {
+    console.error('handleImageMessage_ failed: ' + (error && error.stack ? error.stack : error));
+    notifyUserByPushOrReply_(event, pushTarget, '画像の解析中にエラーが発生しました。時間をおいて再度お試しください。');
+  }
 }
 
 function handleTextMessage_(event) {
@@ -266,6 +290,52 @@ function inferCategoryFromText_(text) {
   }
   return 'その他';
 }
+function extractPushTargetId_(event) {
+  if (!event || !event.source) {
+    return null;
+  }
+  return (
+    event.source.userId ||
+    event.source.groupId ||
+    event.source.roomId ||
+    null
+  );
+}
+
+function safePushLineText_(to, messageText) {
+  try {
+    pushLineText_(to, messageText);
+    return true;
+  } catch (error) {
+    console.error('Push fallback failed: ' + (error && error.stack ? error.stack : error));
+    return false;
+  }
+}
+
+function safeReplyLineText_(replyToken, messageText) {
+  try {
+    replyLineText_(replyToken, messageText);
+    return true;
+  } catch (error) {
+    console.error('Reply failed: ' + (error && error.stack ? error.stack : error));
+    return false;
+  }
+}
+
+function notifyUserByPushOrReply_(event, pushTarget, messageText) {
+  if (pushTarget && safePushLineText_(pushTarget, messageText)) {
+    return true;
+  }
+
+  if (event && event.replyToken && event.mode !== 'standby' && !event.__replied) {
+    if (safeReplyLineText_(event.replyToken, messageText)) {
+      event.__replied = true;
+      return true;
+    }
+  }
+
+  return false;
+}
 
 function isDuplicateEvent_(event) {
   const keySource =
@@ -386,6 +456,4 @@ function trimToLineMessageLimit_(text) {
   }
   return text.slice(0, max - 4) + '\n...';
 }
-
-
 

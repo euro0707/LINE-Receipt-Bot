@@ -84,6 +84,41 @@ function replyLineText_(replyToken, messageText) {
   }, SETTINGS.API_MAX_RETRY, SETTINGS.API_RETRY_BASE_MS, 'LINE reply');
 }
 
+function pushLineText_(to, messageText) {
+  if (!to) {
+    return;
+  }
+
+  const payload = {
+    to: to,
+    messages: [
+      {
+        type: 'text',
+        text: trimToLineMessageLimit_(messageText)
+      }
+    ]
+  };
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json; charset=UTF-8',
+    headers: {
+      Authorization: 'Bearer ' + CONFIG.LINE_CHANNEL_ACCESS_TOKEN
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  return executeWithRetry_(function() {
+    const res = UrlFetchApp.fetch(API_ENDPOINTS.LINE_PUSH, options);
+    const status = res.getResponseCode();
+    if (status >= 200 && status < 300) {
+      return res;
+    }
+    throw new Error('LINE push failed: status=' + status + ' body=' + res.getContentText());
+  }, SETTINGS.API_MAX_RETRY, SETTINGS.API_RETRY_BASE_MS, 'LINE push');
+}
+
 function fetchLineMessageContent_(messageId) {
   const url = API_ENDPOINTS.LINE_CONTENT_BASE + '/' + encodeURIComponent(messageId) + '/content';
   const options = {

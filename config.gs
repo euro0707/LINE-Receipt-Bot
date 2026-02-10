@@ -10,6 +10,7 @@ const CONFIG = {
 
 const API_ENDPOINTS = {
   LINE_REPLY: 'https://api.line.me/v2/bot/message/reply',
+  LINE_PUSH: 'https://api.line.me/v2/bot/message/push',
   LINE_CONTENT_BASE: 'https://api-data.line.me/v2/bot/message',
   GEMINI_GENERATE_CONTENT:
     'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=' +
