@@ -1,4 +1,4 @@
-﻿const APP_VERSION = '2026-02-10-v14';
+﻿const APP_VERSION = '2026-02-11-v20';
 const IMAGE_JOB_QUEUE_KEY = 'image_job_queue_v1';
 const IMAGE_JOB_BATCH_SIZE = 2;
 
@@ -6,31 +6,131 @@ function doGet() {
   return createTextResponse_('LINE receipt bot is running. ' + APP_VERSION);
 }
 
+/**
+ * 処理待ちの画像を手動で処理する
+ * GASエディタの関数リストから実行できます
+ */
+function processQueuedImages() {
+  console.log('=== 処理待ち画像の処理を開始 ===');
+  
+  try {
+    const queueLength = getImageJobQueueLength_();
+    console.log('処理待ちの画像: ' + queueLength + '件');
+    
+    if (queueLength === 0) {
+      console.log('✅ 処理待ちの画像はありません');
+      return '処理待ちの画像はありません';
+    }
+    
+    processPendingImageJobs_();
+    
+    console.log('=== 処理完了 ===');
+    console.log('LINEを確認してください。解析結果が送信されているはずです。');
+    
+    return '処理完了。LINEを確認してください。';
+  } catch (e) {
+    console.error('エラー: ' + (e && e.stack ? e.stack : e));
+    return 'エラーが発生しました: ' + e;
+  }
+}
+
+/**
+ * 画像処理キューをクリアする
+ * 古いメッセージIDが残っている場合に使用
+ */
+function clearImageQueue() {
+  console.log('=== 画像処理キューのクリア ===');
+  
+  try {
+    const beforeLength = getImageJobQueueLength_();
+    console.log('クリア前のキュー: ' + beforeLength + '件');
+    
+    const props = PropertiesService.getScriptProperties();
+    props.deleteProperty(IMAGE_JOB_QUEUE_KEY);
+    
+    const afterLength = getImageJobQueueLength_();
+    console.log('クリア後のキュー: ' + afterLength + '件');
+    console.log('✅ キューをクリアしました');
+    
+    return 'キューをクリアしました（' + beforeLength + '件削除）';
+  } catch (e) {
+    console.error('エラー: ' + (e && e.stack ? e.stack : e));
+    return 'エラーが発生しました: ' + e;
+  }
+}
+
 function doPost(e) {
+  const debugLog = [];
+  const dlog = function(msg) {
+    console.log(msg);
+    debugLog.push(new Date().toISOString().slice(11,19) + ' ' + msg);
+  };
+  
+  dlog('=== doPost called === VERSION=' + APP_VERSION);
+  
+  // Webhook呼び出しを記録
+  try {
+    const cache = CacheService.getScriptCache();
+    cache.put('last_webhook_time', new Date().toISOString(), 600);
+  } catch (cacheError) {
+    dlog('WARN: cache write failed: ' + cacheError);
+  }
+  
   try {
     assertRequiredConfig_();
+    dlog('config OK');
 
     const requestBody = e && e.postData && e.postData.contents ? e.postData.contents : '';
     if (!requestBody) {
+      dlog('empty body');
+      saveDebugLog_(debugLog);
       return createTextResponse_('ok');
     }
+    dlog('body len=' + requestBody.length);
 
     const signature = extractLineSignature_(e);
+    dlog('signature=' + (signature ? 'found' : 'NOT FOUND'));
+    
     if (!verifyLineSignature_(requestBody, signature)) {
-      console.warn('Webhook signature validation failed.');
+      dlog('❌ SIGNATURE VERIFICATION FAILED');
+      saveDebugLog_(debugLog);
       return createTextResponse_('ok');
     }
+    dlog('signature verified OK');
 
     const payload = JSON.parse(requestBody);
     const events = payload.events || [];
-    events.forEach(function(event) {
-      processWebhookEventSafely_(event);
+    dlog('events count=' + events.length);
+    
+    events.forEach(function(event, i) {
+      dlog('event[' + i + '] type=' + (event ? event.type : 'null') + ' msgType=' + (event && event.message ? event.message.type : 'N/A'));
+      dlog('event[' + i + '] replyToken=' + (event && event.replyToken ? 'exists' : 'null'));
+      dlog('event[' + i + '] source=' + JSON.stringify(event && event.source ? event.source : null));
+      
+      try {
+        processWebhookEventSafely_(event);
+        dlog('event[' + i + '] processed OK');
+      } catch (evtErr) {
+        dlog('event[' + i + '] ERROR: ' + evtErr);
+      }
     });
 
+    dlog('=== doPost completed ===');
+    saveDebugLog_(debugLog);
     return createTextResponse_('ok');
   } catch (error) {
-    console.error(error && error.stack ? error.stack : error);
+    dlog('❌ FATAL ERROR: ' + (error && error.stack ? error.stack : error));
+    saveDebugLog_(debugLog);
     return createTextResponse_('ok');
+  }
+}
+
+function saveDebugLog_(logLines) {
+  try {
+    const cache = CacheService.getScriptCache();
+    cache.put('last_dopost_log', logLines.join('\n'), 600);
+  } catch (e) {
+    console.warn('saveDebugLog_ failed: ' + e);
   }
 }
 
@@ -45,29 +145,41 @@ function processWebhookEventSafely_(event) {
 }
 
 function processWebhookEvent_(event) {
+  console.log('processWebhookEvent_: start eventType=' + (event ? event.type : 'null'));
+  
   if (!event || event.mode === 'standby') {
+    console.log('processWebhookEvent_: skipped (standby or null)');
     return;
   }
   if (event.type !== 'message' || !event.message) {
+    console.log('processWebhookEvent_: skipped (not message type)');
     return;
   }
   if (isDuplicateEvent_(event)) {
+    console.log('processWebhookEvent_: skipped (duplicate)');
     return;
   }
 
   const replyToken = event.replyToken;
   if (!replyToken) {
+    console.log('processWebhookEvent_: no replyToken');
     return;
   }
 
-  switch (event.message.type) {
+  const messageType = event.message.type;
+  console.log('processWebhookEvent_: messageType=' + messageType);
+  
+  switch (messageType) {
     case 'image':
+      console.log('processWebhookEvent_: calling handleImageMessage_');
       handleImageMessage_(event);
       return;
     case 'text':
+      console.log('processWebhookEvent_: calling handleTextMessage_');
       handleTextMessage_(event);
       return;
     default:
+      console.log('processWebhookEvent_: unknown message type, sending help');
       replyLineText_(replyToken, buildHelpMessage_());
   }
 }
@@ -75,32 +187,63 @@ function processWebhookEvent_(event) {
 function handleImageMessage_(event) {
   const messageId = event.message.id;
   const pushTarget = extractPushTargetId_(event);
+  console.log('handleImageMessage_: messageId=' + messageId + ' pushTarget=' + pushTarget);
+  
   if (!messageId) {
     notifyUserByPushOrReply_(event, pushTarget, '画像IDが取得できませんでした。もう一度お試しください。');
     return;
   }
 
-  console.log('handleImageMessage_: enqueue messageId=' + messageId + ' hasPushTarget=' + Boolean(pushTarget));
-
-  const acceptedMessage = '画像を受け取りました。解析中です。完了したら結果を送信します。';
+  // 受付メッセージを送信
+  const acceptedMessage = '画像を受け取りました。解析中です...';
   const acceptedByReply = safeReplyLineText_(event.replyToken, acceptedMessage);
   if (acceptedByReply) {
     event.__replied = true;
-  } else if (pushTarget) {
-    safePushLineText_(pushTarget, acceptedMessage);
   }
 
+  // 直接画像を処理（キュー・トリガーを使わない）
   try {
-    const queueLength = enqueueImageJob_({
-      messageId: messageId,
-      pushTarget: pushTarget,
-      enqueuedAt: new Date().toISOString()
-    });
-    console.log('handleImageMessage_: queued messageId=' + messageId + ' queueLength=' + queueLength);
-    ensureImageWorkerTrigger_();
+    console.log('handleImageMessage_: fetching content');
+    const content = fetchLineMessageContent_(messageId);
+    console.log('handleImageMessage_: content fetched bytes=' + content.bytes.length);
+
+    console.log('handleImageMessage_: saving to Drive');
+    const savedFile = saveReceiptImageToDrive_(content.bytes, content.mimeType, new Date(), messageId);
+    console.log('handleImageMessage_: image saved fileId=' + savedFile.id);
+
+    console.log('handleImageMessage_: analyzing image');
+    const analysis = analyzeReceiptImage_(content.bytes, content.mimeType);
+    console.log('handleImageMessage_: analysis done');
+
+    const hasItems = analysis.items && analysis.items.length > 0;
+    if (!hasItems && !toNumber_(analysis.total)) {
+      console.log('handleImageMessage_: no items detected');
+      safePushLineText_(pushTarget, 'レシートを読み取れませんでした。別の画像でお試しください。');
+      return;
+    }
+
+    console.log('handleImageMessage_: appending to sheet');
+    appendReceiptToSheet_(analysis);
+    console.log('handleImageMessage_: building summary');
+    const summary = buildMonthlySummary_(new Date());
+    console.log('handleImageMessage_: formatting reply');
+    const message = formatReceiptReply_(analysis, summary, savedFile);
+    console.log('handleImageMessage_: sending result');
+    safePushLineText_(pushTarget, message);
+    console.log('handleImageMessage_: completed successfully');
   } catch (error) {
-    console.error('handleImageMessage_: enqueue failed: ' + (error && error.stack ? error.stack : error));
-    notifyUserByPushOrReply_(event, pushTarget, '画像の受付でエラーが発生しました。時間をおいて再度お試しください。');
+    const errorDetails = (error && error.stack ? error.stack : String(error));
+    console.error('handleImageMessage_: ERROR - ' + errorDetails);
+    
+    // エラー詳細をキャッシュに保存
+    try {
+      const cache = CacheService.getScriptCache();
+      cache.put('last_image_error', errorDetails, 600);
+    } catch (cacheErr) {
+      console.warn('Failed to cache error: ' + cacheErr);
+    }
+    
+    safePushLineText_(pushTarget, '画像の解析中にエラーが発生しました。時間をおいて再度お試しください。');
   }
 }
 
